@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Kinesis to S3 (one bucket) with Glue Job, Crawler for Athena, and Lambda validation
+
+Resources:
+
+  ### S3 Bucket ###
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: 'jon-kinesis-data-lake'
+
+  ### Kinesis Data Stream ###
+  DataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+
+  ### Consolidated IAM Role for Glue (Job + Crawler) ###
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'jon-kinesis-glue-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: CustomGluePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - arn:aws:s3:::jon-kinesis-data-lake/*
+                  - arn:aws:s3:::jon-kinesis-data-lake
+                  - arn:aws:s3:::jon-scripts-bucket/*
+                  - arn:aws:s3:::jon-scripts-bucket
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetPartition
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  ### Glue Job ###
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: 'jon-kinesis-glue-job'
+      Role: !GetAtt GlueExecutionRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://jon-scripts-bucket/jon-kinesis-glue-job-script.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        "--TempDir": !Sub 's3://jon-kinesis-data-lake/temp/'
+      GlueVersion: '3.0'
+      MaxCapacity: 2.0
+
+  ### Glue Crawler ###
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: 'jon-kinesis-glue-crawler'
+      Role: !GetAtt GlueExecutionRole.Arn
+      DatabaseName: 'jon-kinesis-athena-db'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://jon-kinesis-data-lake/processed/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+
+  ### Lambda Execution Role ###
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'jon-kinesis-lambda-exec-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaKinesisS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - arn:aws:s3:::jon-kinesis-data-lake/raw/*
+                  - arn:aws:s3:::jon-kinesis-data-lake/unformatted/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListStreams
+                Resource: '*'
+
+  ### Lambda Function ###
+  StreamProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'jon-kinesis-stream-processor'
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+          from datetime import datetime
+
+          s3 = boto3.client('s3')
+          bucket = 'jon-kinesis-data-lake'
+
+          def is_valid_json(s):
+              try:
+                  json.loads(s)
+                  return True
+              except:
+                  return False
+
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  payload = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                  timestamp = datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S-%f')
+                  key_prefix = 'raw/' if is_valid_json(payload) else 'unformatted/'
+                  key = f"{key_prefix}record_{timestamp}.json"
+                  s3.put_object(Bucket=bucket, Key=key, Body=payload)
+              return {'statusCode': 200}
+
+  ### Event Source Mapping ###
+  KinesisToLambdaEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DataStream.Arn
+      FunctionName: !GetAtt StreamProcessorLambda.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      Enabled: true
+
+  ### Lambda Permission for Kinesis ###
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StreamProcessorLambda
+      Action: lambda:InvokeFunction
+      Principal: kinesis.amazonaws.com
+      SourceArn: !GetAtt DataStream.Arn
+
+Outputs:
+
+  StreamName:
+    Description: "Kinesis Data Stream Name"
+    Value: !Ref DataStream
+
+  DataLakeBucket:
+    Description: "Unified S3 Bucket for Raw and Processed Data"
+    Value: !Ref DataLakeBucket
+
+  GlueJobName:
+    Description: "Glue Job Name"
+    Value: !Ref GlueJob
+
+  GlueCrawlerName:
+    Description: "Glue Crawler Name"
+    Value: !Ref GlueCrawler

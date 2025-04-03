@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Scheduled Step Function to orchestrate hourly Glue Job and Crawler
+
+Resources:
+
+  StepFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: StepFunctionExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowGlueStart
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:StartCrawler
+                Resource: '*'
+
+  EventBridgeInvokeStepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EventBridgeInvokeStepFunctionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowInvokeStepFunction
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: '*'
+
+  GlueJobOrchestrationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: 'hourly-glue-orchestration'
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn  # replace with your actual role or define one
+      DefinitionString: !Sub |
+        {
+          "Comment": "Run Glue Job then Crawler",
+          "StartAt": "Start Glue Job",
+          "States": {
+            "Start Glue Job": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "jon-kinesis-glue-job"
+              },
+              "Next": "Start Glue Crawler"
+            },
+            "Start Glue Crawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "jon-kinesis-glue-crawler"
+              },
+              "End": true
+            }
+          }
+        }
+
+  StepFunctionScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'hourly-glue-sfn-trigger'
+      ScheduleExpression: 'cron(0 * * * ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt GlueJobOrchestrationStateMachine.Arn
+          RoleArn: !GetAtt EventBridgeInvokeStepFunctionRole.Arn  # replace with your actual role
+          Id: 'TriggerGlueSfn'
